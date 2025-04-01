@@ -1,0 +1,6 @@
+streamlit
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+# Potentially add libraries for PDF text extraction if attempting that compromise
+# e.g., pypdf2 or pymupdf 
