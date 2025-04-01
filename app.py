@@ -15,7 +15,7 @@ import traceback
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
 REDIRECT_URI_TYPE = 'urn:ietf:wg:oauth:2.0:oob'
-GRANTI_AUNTY_AVATAR = "https://raw.githubusercontent.com/MilaNLProc/Python-ANVIL/main/anvil/prototyping/icons/granti_aunty_placeholder.png" # Replace with your desired URL or local path if added to repo
+GRANTI_AUNTY_AVATAR = "https://www.vecteezy.com/vector-art/13899952-female-user-profile-the-avatar-is-a-woman-a-character-for-a-screen-saver-with-happy-emotions-for-website-and-mobile-app-design-vector-illustration-on-a-white-isolated-background" # Replace with your desired URL or local path if added to repo
 
 # --- Load Individual Secret Values ---
 # (Same robust loading logic as before)
