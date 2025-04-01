@@ -15,7 +15,7 @@ import traceback
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
 REDIRECT_URI_TYPE = 'urn:ietf:wg:oauth:2.0:oob'
-GRANTI_AUNTY_AVATAR = "https://openclipart.org/download/331395/anime-cartoon-smiling-woman.svg" # Replace with your desired URL or local path if added to repo
+GRANTI_AUNTY_AVATAR = "https://images.icon-icons.com/3708/PNG/512/girl_female_woman_person_face_people_curly_hair_icon_230020.png" # Replace with your desired URL or local path if added to repo
 
 # --- Load Individual Secret Values ---
 # (Same robust loading logic as before)
