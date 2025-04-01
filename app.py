@@ -4,7 +4,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import os
-import json # We will definitely use json now
+import json
 from datetime import datetime
 import io
 import sys
@@ -12,123 +12,82 @@ import traceback
 
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
-
-# --- Robust Credential Loading, Manual Build, and JSON Sanitize ---
-FINAL_CONFIG_DICT = None # Initialize
-print("--- Attempting to load and sanitize credentials ---")
-
-try:
-    # 1. Access secrets
-    if not hasattr(st, 'secrets') or "google_credentials" not in st.secrets:
-        raise KeyError("Streamlit secrets object 'st.secrets' not found or missing '[google_credentials]' section.")
-
-    google_creds_section = st.secrets["google_credentials"]
-    if "web" not in google_creds_section:
-        raise KeyError("Missing 'web' section within `[google_credentials]` in Streamlit Secrets.")
-
-    web_config_from_secrets = google_creds_section["web"]
-    print(f"DEBUG: Type of web_config_from_secrets: {type(web_config_from_secrets)}")
-
-    # 2. Explicitly build a standard Python dictionary
-    web_config_dict = {}
-    required_keys = ["client_id", "project_id", "auth_uri", "token_uri", "client_secret"]
-    has_redirect_uris = hasattr(web_config_from_secrets, 'redirect_uris') or 'redirect_uris' in web_config_from_secrets
-    if has_redirect_uris:
-         required_keys.append('redirect_uris')
-
-    print(f"DEBUG: Building intermediate dict. Expecting keys: {required_keys}")
-    missing_keys = []
-    for key in required_keys:
-        value = None
-        if hasattr(web_config_from_secrets, key):
-             value = getattr(web_config_from_secrets, key)
-        elif key in web_config_from_secrets:
-             value = web_config_from_secrets[key]
-
-        if value is not None:
-            web_config_dict[key] = value
-        else:
-             missing_keys.append(key)
-
-    if missing_keys:
-        raise ValueError(f"Required keys missing in secrets 'web' section: {missing_keys}")
-
-    # Ensure redirect_uris is a list if present
-    if 'redirect_uris' in web_config_dict:
-        if not isinstance(web_config_dict['redirect_uris'], list):
-            print(f"WARN: redirect_uris type is {type(web_config_dict['redirect_uris'])}, converting to list.")
-            if isinstance(web_config_dict['redirect_uris'], str):
-                 web_config_dict['redirect_uris'] = [web_config_dict['redirect_uris']]
-            else:
-                 raise TypeError("redirect_uris in secrets must be a list or a single string.")
-        print("DEBUG: redirect_uris is list or converted to list.")
-
-
-    # 3. Construct the full structure needed by Google Lib
-    full_config_dict_intermediate = {"web": web_config_dict}
-    print(f"DEBUG: Intermediate dict built: Type={type(full_config_dict_intermediate)}, Keys={full_config_dict_intermediate.keys()}")
-
-    # --- CRUCIAL STEP: Serialize to JSON string, then parse back ---
-    # This forces conversion to standard Python types
-    try:
-        print("DEBUG: Serializing intermediate dict to JSON string...")
-        config_json_string = json.dumps(full_config_dict_intermediate)
-        print("DEBUG: JSON string created. Parsing back to final dict...")
-        FINAL_CONFIG_DICT = json.loads(config_json_string)
-        print("DEBUG: Final config dict created via JSON parse.")
-        print(f"DEBUG: Type of FINAL_CONFIG_DICT: {type(FINAL_CONFIG_DICT)}")
-        print(f"DEBUG: Type of FINAL_CONFIG_DICT['web']: {type(FINAL_CONFIG_DICT.get('web'))}")
-
-        # Final verification of structure
-        if not isinstance(FINAL_CONFIG_DICT, dict) or 'web' not in FINAL_CONFIG_DICT or not isinstance(FINAL_CONFIG_DICT['web'], dict):
-             raise TypeError("Final config dict structure is invalid after JSON parsing.")
-
-        print("--- Credentials successfully loaded and sanitized ---")
-
-    except TypeError as te:
-        # This is where the original error likely happened implicitly
-        print(f"ERROR: TypeError during JSON serialization/deserialization: {te}")
-        print("ERROR: This likely means a non-standard type persisted from st.secrets.")
-        print(f"DEBUG: Intermediate dict causing error: {full_config_dict_intermediate}") # Print the problematic dict
-        raise te # Re-raise the error to stop execution
-
-except KeyError as e:
-    err_msg = f"KeyError accessing secrets: Missing key '{e}'. Check `[google_credentials.web]` structure."
-    print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-    st.error(err_msg)
-    st.stop()
-except AttributeError as e:
-     err_msg = f"AttributeError accessing secrets: '{e}'. Check `[google_credentials.web]` structure/names."
-     print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-     st.error(err_msg)
-     st.stop()
-except ValueError as e: # Catch missing keys error
-    err_msg = f"ValueError processing credentials: {e}"
-    print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-    st.error(err_msg)
-    st.stop()
-except TypeError as e: # Catch redirect_uris or JSON errors
-     err_msg = f"TypeError processing credentials: {e}"
-     print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-     st.error(err_msg)
-     st.stop()
-except Exception as e:
-    err_msg = f"Unexpected error processing credentials from secrets: {e}"
-    print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-    st.error(err_msg)
-    st.stop()
-
-
-# --- Rest of the Configuration (Unchanged) ---
 REDIRECT_URI_TYPE = 'urn:ietf:wg:oauth:2.0:oob'
 
+# --- Load Individual Secret Values ---
+# Initialize variables
+client_id = None
+project_id = None
+auth_uri = None
+token_uri = None
+auth_provider_x509_cert_url = None
+client_secret = None
+redirect_uris = None # Will remain None if not in secrets
+
+print("--- Attempting to load individual credential values from secrets ---")
+try:
+    # Use .get() for safer access, checking existence implicitly
+    secrets_web = st.secrets.get("google_credentials", {}).get("web", {})
+
+    if not secrets_web:
+        raise ValueError("`[google_credentials.web]` section not found or empty in secrets.")
+
+    client_id = secrets_web.get("client_id")
+    project_id = secrets_web.get("project_id")
+    auth_uri = secrets_web.get("auth_uri")
+    token_uri = secrets_web.get("token_uri")
+    auth_provider_x509_cert_url = secrets_web.get("auth_provider_x509_cert_url")
+    client_secret = secrets_web.get("client_secret")
+    redirect_uris = secrets_web.get("redirect_uris") # May be None
+
+    # Validate required fields
+    required_values = {
+        "client_id": client_id,
+        "project_id": project_id,
+        "auth_uri": auth_uri,
+        "token_uri": token_uri,
+        "client_secret": client_secret
+        # auth_provider_x509_cert_url is often optional for the flow itself
+        # redirect_uris is optional depending on flow type/config
+    }
+    missing = [k for k, v in required_values.items() if not v]
+    if missing:
+        raise ValueError(f"Required credential values missing from secrets: {missing}")
+
+    # Ensure redirect_uris is a list if it exists and is not None
+    if redirect_uris is not None and not isinstance(redirect_uris, list):
+         if isinstance(redirect_uris, str):
+              print("WARN: redirect_uris in secrets was a string, converting to list.")
+              redirect_uris = [redirect_uris]
+         else:
+              raise TypeError(f"redirect_uris in secrets must be a list or string, found {type(redirect_uris)}")
+
+    print("--- Individual credential values loaded successfully ---")
+    # Print safely for debugging
+    print(f"DEBUG: client_id type: {type(client_id)}")
+    print(f"DEBUG: client_secret type: {type(client_secret)}")
+    print(f"DEBUG: redirect_uris type: {type(redirect_uris)}, value: {redirect_uris}")
+
+
+except (KeyError, AttributeError, ValueError, TypeError) as e:
+    err_msg = f"Error accessing or validating secrets: {e}. Please ensure '[google_credentials.web]' section and its keys (client_id, client_secret, etc.) exist and are correct in your Streamlit Secrets."
+    print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
+    st.error(err_msg)
+    st.stop()
+except Exception as e:
+    err_msg = f"Unexpected error during secret loading: {e}"
+    print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
+    st.error(err_msg)
+    st.stop()
+
+
+# --- Constants & Prompts (Unchanged) ---
 PROJECT_DETAILS = {
     "Lead Company Name": "FLOX Limited",
     "Project title": "NetFLOX360 – Bridging Poultry Farm Data with Factory Insights using Artificial Intelligence for Sustainable Growth",
     "Project Number": "10103645",
     "Total Quarters": 4
 }
-
 report_section_keys = [
     "quarter_end_date",
     "overall_summary", "progress", "issues_actions", "scope", "time",
@@ -162,17 +121,27 @@ def get_credentials():
          print("DEBUG: Valid credentials found in session state.")
          return st.session_state.credentials
 
-    if not FINAL_CONFIG_DICT: # Check if sanitized config is available
-         err_msg = "Critical Error: FINAL_CONFIG_DICT is not set (failed during credential loading). Cannot create OAuth Flow."
-         print(f"ERROR: {err_msg}")
-         st.error(err_msg)
-         return None
+    # --- Construct the config dict JUST BEFORE use ---
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "project_id": project_id,
+            "auth_uri": auth_uri,
+            "token_uri": token_uri,
+            "auth_provider_x509_cert_url": auth_provider_x509_cert_url,
+            "client_secret": client_secret
+            # Add redirect_uris only if it was actually found in secrets
+        }
+    }
+    if redirect_uris is not None:
+        client_config["web"]["redirect_uris"] = redirect_uris
 
-    print("DEBUG: Creating OAuth Flow instance using FINAL_CONFIG_DICT...")
+    print("DEBUG: Creating OAuth Flow instance with dynamically built config dict...")
+    print(f"DEBUG: Config passed to Flow: {{'web': {{'client_id': '{client_id[:10]}...', 'project_id': '{project_id}', ..., 'client_secret': '***HIDDEN***'}}}}") # Safe print
+
     try:
-        # *** Use the sanitized dictionary ***
         flow = Flow.from_client_config(
-            FINAL_CONFIG_DICT,
+            client_config, # Pass the dictionary built right here
             scopes=SCOPES,
             redirect_uri=REDIRECT_URI_TYPE
         )
@@ -180,12 +149,12 @@ def get_credentials():
     except ValueError as e:
         err_msg = f"ValueError creating OAuth Flow. Check credentials dictionary structure passed: {e}"
         print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-        st.error(err_msg)
+        st.error(err_msg + " Check app logs for details.")
         return None
     except Exception as e:
         err_msg = f"Unexpected error creating OAuth Flow: {e}"
         print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
-        st.error(err_msg)
+        st.error(err_msg + " Check app logs for details.")
         return None
 
     # --- Rest of get_credentials function is unchanged ---
@@ -221,7 +190,7 @@ def get_credentials():
                 return flow.credentials
             except Exception as e:
                 err_msg = f"Error fetching token with provided code. Was the code pasted correctly? Error: {e}"
-                print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
+                print(f"ERROR: {err_msg}\n{traceback.format_exc()}") # Print detailed traceback to logs
                 st.error(err_msg)
                 if 'credentials' in st.session_state:
                     del st.session_state['credentials']
@@ -235,6 +204,7 @@ def get_credentials():
         print(f"ERROR: {err_msg}")
         st.error(err_msg)
         return None
+
 
 # --- Google Docs API Function (Unchanged) ---
 def create_google_doc(credentials, quarter_number, answers):
@@ -309,7 +279,6 @@ def create_google_doc(credentials, quarter_number, answers):
          st.error(err_msg)
          return None
 
-
 # --- Initialize Streamlit Session State (Unchanged) ---
 if 'messages' not in st.session_state:
     st.session_state.messages = []
@@ -342,9 +311,8 @@ if creds and creds.valid:
          st.rerun()
 else:
     st.sidebar.warning("Not authenticated with Google.")
-    # The login button now just triggers the display logic within get_credentials if creds are missing
     if st.sidebar.button("Login with Google"):
-        get_credentials() # Call it to potentially display the auth prompt if not logged in
+        get_credentials() # Call to potentially display the auth prompt
 
 st.sidebar.divider()
 st.sidebar.subheader("File Upload (Session Only)")
@@ -373,9 +341,9 @@ with chat_container:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-# --- Handle Chat Input (Unchanged from previous debug version) ---
+# --- Handle Chat Input (Unchanged) ---
 if prompt := st.chat_input("Your answer or command...", key="chat_input_main"):
-    print(f"DEBUG: User input received: '{prompt[:50]}...'") # Log user input safely
+    print(f"DEBUG: User input received: '{prompt[:50]}...'")
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     current_stage = st.session_state.stage
@@ -408,7 +376,7 @@ if prompt := st.chat_input("Your answer or command...", key="chat_input_main"):
             last_key = report_section_keys[last_section_index]
             print(f"DEBUG: Saving answer for section: '{last_key}'")
 
-            if not prompt and last_key not in ["optional_section_key_if_any"]: # Add actual optional keys if needed
+            if not prompt and last_key not in ["optional_section_key_if_any"]:
                  bot_response = f"Please provide some input for the '{last_key.replace('_',' ').title()}' section."
                  trigger_rerun = True
             else:
@@ -431,7 +399,7 @@ if prompt := st.chat_input("Your answer or command...", key="chat_input_main"):
             print("DEBUG: Handling 'confirm_generate' stage.")
             if prompt.lower() in ["yes", "y", "ok", "generate", "confirm"]:
                 print("DEBUG: User confirmed generation. Checking credentials...")
-                creds = get_credentials() # Check/refresh credentials
+                creds = get_credentials()
                 if not creds or not creds.valid:
                      bot_response = "Authentication needed. Please use the 'Login with Google' button in the sidebar and complete the authorization steps first."
                      print("DEBUG: Credentials invalid/missing for generation.")
@@ -504,16 +472,15 @@ if prompt := st.chat_input("Your answer or command...", key="chat_input_main"):
         print("--- Suppressing Streamlit Rerun (likely waiting for user action) ---")
 
 
-# --- Initial Bot Prompt ---
+# --- Initial Bot Prompt (Unchanged) ---
 if not st.session_state.messages:
      print("--- Adding initial bot prompt ---")
      initial_prompt = report_section_prompts["start"]
      st.session_state.messages.append({"role": "assistant", "content": initial_prompt})
      st.rerun()
 elif st.session_state.stage == "start" and len(st.session_state.messages) > 0 and st.session_state.messages[-1]["role"] == "user":
-     # Handle edge case where stage reset without bot response after user input
      print("DEBUG: Stage is 'start' but last message was from user. Re-adding start prompt.")
      initial_prompt = report_section_prompts["start"]
-     if st.session_state.messages[-1].get("content") != initial_prompt: # Avoid double prompts
+     if st.session_state.messages[-1].get("content") != initial_prompt:
         st.session_state.messages.append({"role": "assistant", "content": initial_prompt})
         st.rerun()
