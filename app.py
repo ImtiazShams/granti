@@ -4,28 +4,37 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import os
-import json
+import json # Keep json import, might be useful elsewhere, though not for Flow config now
 from datetime import datetime
 import io
 
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file'] # Access Docs and create files
-# Use secrets for credentials
+
+# Prepare the client config dictionary directly from secrets
 try:
-    # This structure matches how secrets are accessed from secrets.toml
-    CLIENT_CONFIG = st.secrets["google_credentials"]["web"]
-    # Ensure keys match the downloaded credentials.json format
-    CLIENT_CONFIG_JSON = json.dumps({"web": CLIENT_CONFIG}) 
+    # Get the AttrDict for the 'web' part
+    web_config_attrdict = st.secrets["google_credentials"]["web"]
+    # Convert the AttrDict to a standard Python dictionary
+    web_config_dict = dict(web_config_attrdict)
+    # Construct the full dictionary structure expected by from_client_config
+    required_keys = ["client_id", "project_id", "auth_uri", "token_uri", "client_secret"] # Add others if needed (like redirect_uris if specified in secrets)
+    if not all(key in web_config_dict for key in required_keys):
+        missing = [key for key in required_keys if key not in web_config_dict]
+        st.error(f"Google Credentials in Streamlit Secrets are missing keys in the 'web' section: {missing}")
+        st.stop()
+        
+    # This is the dictionary we will pass to the Flow function
+    FULL_CLIENT_CONFIG_DICT = {"web": web_config_dict} 
+    
 except KeyError:
-    st.error("Google Credentials not found in Streamlit Secrets. Please configure secrets.toml.")
+    st.error("Google Credentials section `[google_credentials.web]` not found or incomplete in Streamlit Secrets. Please check configuration.")
     st.stop()
 except Exception as e:
-    st.error(f"Error loading credentials from secrets: {e}")
+    st.error(f"Error processing credentials from secrets: {e}")
     st.stop()
-    
+
 # Determine Redirect URI - Use App URL for deployed apps, localhost for local testing
-# This is often tricky. For Streamlit Cloud, you might need to use 'Out Of Band' (oob) flow
-# or set the deployed app's URL as the redirect URI in Google Cloud Console.
 # Using 'oob' for broader compatibility initially:
 REDIRECT_URI_TYPE = 'urn:ietf:wg:oauth:2.0:oob' # Or your configured URL
 
@@ -39,11 +48,10 @@ PROJECT_DETAILS = {
 
 # Report sections (simplified for chatbot flow)
 report_section_keys = [
+    "quarter_end_date", # Ask this first
     "overall_summary", "progress", "issues_actions", "scope", "time",
     "cost", "exploitation", "risk_management", "project_planning",
-    "next_quarter_forecast", 
-    # Note: Handling the detailed progress table is very difficult in a pure chat flow.
-    # It might be better to ask for a summary or handle it outside the bot.
+    "next_quarter_forecast",
 ]
 report_section_prompts = {
     "start": "Welcome! Which reporting quarter (1-{0}) are you working on?".format(PROJECT_DETAILS['Total Quarters']),
@@ -59,41 +67,66 @@ report_section_prompts = {
     "project_planning": "How has 'Project Planning' been? Describe team collaboration, PM challenges, and any improvements made. Has the Gantt chart been updated?",
     "next_quarter_forecast": "Finally, what is the 'Updated forecast for next quarter'? Main activities, challenges, and scheduled deliverables?",
     "upload_request": "For context (e.g., for Risk or Time sections), you might need to refer to specific documents. If you need to upload one now, use the uploader below. **Note: Uploaded files are only available during this session.**",
-    "ready_to_generate": "I have collected information for all sections. Are you ready to generate the Google Doc draft?",
+    "ready_to_generate": "I have collected information for all sections. Are you ready to generate the Google Doc draft? (Type 'yes' to confirm)",
     "generation_complete": "Done! You can find the draft document '{0}' in your Google Drive.",
     "error": "Sorry, something went wrong. Please try again."
-    # Add prompts for specific file requests if needed
 }
 
 # --- Google Authentication ---
 def get_credentials():
     """Gets user credentials using OAuth 2.0 flow."""
-    if 'credentials' in st.session_state and st.session_state.credentials.valid:
-        return st.session_state.credentials
+    # Check if valid credentials already exist in session state
+    if 'credentials' in st.session_state and st.session_state.credentials and st.session_state.credentials.valid:
+         # Add logic to check if token needs refresh? Google library usually handles this.
+         # if st.session_state.credentials.expired and st.session_state.credentials.refresh_token:
+         #     st.session_state.credentials.refresh(Request()) # Requires google.auth.transport.requests
+         #     st.experimental_rerun()
+         return st.session_state.credentials
 
-    # Use io.StringIO to load the config from the string derived from secrets
-    flow = Flow.from_client_config(json.loads(CLIENT_CONFIG_JSON), scopes=SCOPES, redirect_uri=REDIRECT_URI_TYPE)
-    
+    # Create Flow instance using the dictionary loaded from secrets
+    try:
+        flow = Flow.from_client_config(
+            FULL_CLIENT_CONFIG_DICT,  # Pass the prepared dictionary
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI_TYPE
+        )
+    except ValueError as e:
+        st.error(f"Error creating OAuth Flow. Check credentials format in Secrets: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Unexpected error creating OAuth Flow: {e}")
+        return None
+
+    # Proceed with the selected OAuth flow type
     if REDIRECT_URI_TYPE == 'urn:ietf:wg:oauth:2.0:oob':
         # Use Out-of-Band flow (user copies code)
         auth_url, _ = flow.authorization_url(prompt='consent')
         st.warning(f"Please go to this URL to authorize the application:\n{auth_url}")
-        auth_code = st.text_input("Enter the authorization code here:")
+        # Use a unique key for the text input to avoid conflicts
+        auth_code = st.text_input("Enter the authorization code here:", key="google_auth_code_input")
+
         if auth_code:
             try:
+                # Attempt to fetch token using the provided code
                 flow.fetch_token(code=auth_code)
-                st.session_state.credentials = flow.credentials
-                st.experimental_rerun() # Rerun to update state after getting creds
+                st.session_state.credentials = flow.credentials # Store credentials in session state
+                st.success("Google authentication successful!")
+                # Use st.rerun() instead of st.experimental_rerun() in newer Streamlit versions
+                st.rerun() # Rerun to update UI state after getting creds
                 return flow.credentials
             except Exception as e:
-                st.error(f"Error fetching token: {e}")
+                st.error(f"Error fetching token with provided code: {e}")
+                # Clear potentially invalid credentials if fetching fails
+                if 'credentials' in st.session_state:
+                    del st.session_state['credentials']
                 return None
         else:
-            return None # Waiting for user input
+            # Still waiting for user to enter the authorization code
+            st.info("Waiting for authorization code entry...")
+            return None
     else:
-        # Standard web flow (more complex with Streamlit Cloud redirects)
-        # ... implementation would go here ...
-        st.error("Standard web auth flow not fully implemented for this example. Consider using 'oob'.")
+        # Placeholder for standard web flow (if implemented later)
+        st.error("Standard web auth flow not fully implemented for this example. Using 'oob' flow.")
         return None
 
 
@@ -105,59 +138,44 @@ def create_google_doc(credentials, quarter_number, answers):
         drive_service = build('drive', 'v3', credentials=credentials) # Need drive service to set title
 
         title = f"Innovate UK Q{quarter_number} Report - {PROJECT_DETAILS['Project Number']} - Draft {datetime.now().strftime('%Y%m%d_%H%M')}"
-        
-        # Basic document structure
+
+        # 1. Create the document
         body = {'title': title}
         doc = service.documents().create(body=body).execute()
         doc_id = doc.get('documentId')
 
-        st.write(f"Created document with ID: {doc_id}") # Debugging
-
-        # Prepare content requests
-        requests = [
-            {'insertText': {'location': {'index': 1}, 'text': f"# Innovate UK Quarterly Report - Q{quarter_number}\n\n"}},
-             {'insertText': {'location': {'index': 1}, 'text': f"**Project:** {PROJECT_DETAILS['Project title']} ({PROJECT_DETAILS['Project Number']})\n"}},
-             {'insertText': {'location': {'index': 1}, 'text': f"**Quarter End Date:** {answers.get('quarter_end_date', 'N/A')}\n\n---\n\n"}},
-        ]
-
-        # Add sections dynamically
-        offset = len(requests[0]['insertText']['text']) + len(requests[1]['insertText']['text']) + len(requests[2]['insertText']['text']) +1 # Track insertion point
-
-        for key in report_section_keys:
-             section_title = key.replace('_', ' ').title()
-             content = answers.get(key, '*No data entered*') + "\n\n---\n\n"
-             requests.append({'insertText': {'location': {'index': offset}, 'text': f"## {section_title}\n\n{content}"}})
-             offset += len(f"## {section_title}\n\n{content}")
-        
-        # Ensure requests are ordered by index DESCENDING for safe insertion if indexes were complex
-        # But since we append and calculate offset, ASCENDING works here.
-        
-        # Batch update - note Google Docs API processes requests sequentially based on list order.
-        # Ensure your calculated offsets are correct for sequential insertion at a *growing* index.
-        # Simpler approach: Insert sections one by one or build the full text first.
-
-        # Let's try building full text first for simplicity:
+        # 2. Build the full report text
         full_text = f"# Innovate UK Quarterly Report - Q{quarter_number}\n\n"
         full_text += f"**Project:** {PROJECT_DETAILS['Project title']} ({PROJECT_DETAILS['Project Number']})\n"
         full_text += f"**Quarter End Date:** {answers.get('quarter_end_date', 'N/A')}\n\n---\n\n"
+        # Iterate through sections in the defined order, skipping the date as it's already included
         for key in report_section_keys:
+            if key == "quarter_end_date": continue # Skip adding date again here
             section_title = key.replace('_', ' ').title()
             content = answers.get(key, '*No data entered*')
             full_text += f"## {section_title}\n\n{content}\n\n---\n\n"
 
+        # 3. Prepare the batchUpdate request to insert the text
+        # Google Docs API inserts text at index 1 (after title segment)
         requests = [{'insertText': {'location': {'index': 1}, 'text': full_text}}]
 
-
-        # Apply updates
+        # 4. Execute the batchUpdate
         result = service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
-        st.success(f"Successfully updated Google Doc.")
+        st.success(f"Successfully created and updated Google Doc.")
         return title # Return title for confirmation message
 
     except HttpError as error:
-        st.error(f"An error occurred with Google Docs API: {error}")
+        st.error(f"An error occurred with Google Docs/Drive API: {error}")
+        # Attempt to parse error details if possible
+        error_details = getattr(error, 'resp', {}).get('content', '{}')
+        try:
+             error_json = json.loads(error_details)
+             st.json(error_json) # Display detailed error from Google if available
+        except:
+             st.write(f"Raw error content: {error_details}") # Show raw error if not JSON
         return None
     except Exception as e:
-         st.error(f"An unexpected error occurred: {e}")
+         st.error(f"An unexpected error occurred during document creation: {e}")
          return None
 
 # --- Initialize Streamlit Session State ---
@@ -176,44 +194,54 @@ if 'credentials' not in st.session_state:
 if 'uploaded_files_info' not in st.session_state:
     st.session_state.uploaded_files_info = {} # Store info about uploaded files this session
 
+
 # --- App Layout ---
+st.set_page_config(page_title="IUK Grant Bot", layout="wide")
 st.title("Innovate UK Grant Reporting Chatbot")
 st.write(f"Assisting with: {PROJECT_DETAILS['Project title']}")
 
-# --- Authentication Section ---
+# --- Authentication Section (Sidebar) ---
 st.sidebar.title("Google Authentication")
-if st.session_state.credentials and st.session_state.credentials.valid:
+# Check credentials validity more robustly
+creds = st.session_state.get('credentials')
+if creds and creds.valid:
     st.sidebar.success("Authenticated with Google.")
-    # Optional: Add logout button
     if st.sidebar.button("Logout Google"):
          st.session_state.credentials = None
-         st.experimental_rerun()
+         st.rerun()
 else:
     st.sidebar.warning("Not authenticated with Google.")
     if st.sidebar.button("Login with Google"):
-        # Attempt to get credentials - this might involve user interaction via text input
-        get_credentials()
-        # The rerun should happen within get_credentials if auth code is entered
+        # This button click triggers the auth flow display within get_credentials
+        # The actual credential setting happens when the auth code is entered
+        get_credentials() # Call to display auth URL and input box if needed
+        # No need to rerun here, rerun happens inside get_credentials upon success
 
-# --- File Uploader Section ---
-# Only show uploader when requested or relevant?
-# Placed in sidebar for now for easier access during chat.
+
+# --- File Uploader Section (Sidebar) ---
 st.sidebar.divider()
 st.sidebar.subheader("File Upload (Session Only)")
 uploaded_file = st.sidebar.file_uploader(
     "Upload relevant documents when asked",
-    type=['pdf', 'docx', 'xlsx', 'png', 'jpg'],
-    key="file_uploader"
+    type=['pdf', 'docx', 'xlsx', 'png', 'jpg', 'txt'], # Added txt
+    key="file_uploader",
+    help="Files uploaded here are only available during the current session and are not stored long-term."
 )
 if uploaded_file:
-    st.session_state.uploaded_files_info[uploaded_file.name] = {
-        "type": uploaded_file.type,
-        "size": uploaded_file.size
-        # Don't store the buffer itself in session state - too large
-    }
-    st.sidebar.success(f"File '{uploaded_file.name}' ready for this session.")
-    # Ideally, could try text extraction here and store text if needed
-    # For now, just acknowledge upload. Bot needs to know what to do with it.
+    # Check size to prevent excessive memory usage in session state
+    MAX_FILE_SIZE_MB = 5
+    if uploaded_file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        st.sidebar.error(f"File size exceeds {MAX_FILE_SIZE_MB}MB limit for session storage.")
+    else:
+        st.session_state.uploaded_files_info[uploaded_file.name] = {
+            "type": uploaded_file.type,
+            "size": uploaded_file.size
+            # Consider adding content extraction here if needed, store extracted text?
+            # e.g., if uploaded_file.type == "text/plain":
+            # stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+            # st.session_state.uploaded_files_info[uploaded_file.name]['content'] = stringio.read()
+        }
+        st.sidebar.success(f"File '{uploaded_file.name}' available for this session.")
 
 
 # --- Display Chat History ---
@@ -231,6 +259,7 @@ if prompt := st.chat_input("Your answer or command..."):
     # Bot Logic based on stage
     current_stage = st.session_state.stage
     bot_response = ""
+    trigger_rerun = True # Default to rerun unless waiting for input like auth code
 
     try:
         if current_stage == "start":
@@ -241,24 +270,13 @@ if prompt := st.chat_input("Your answer or command..."):
                     st.session_state.answers = {} # Reset answers for new quarter
                     st.session_state.current_section_index = 0 # Start asking sections
                     st.session_state.stage = "ask_section"
-                     # Ask first section prompt immediately after setting stage
+                    # Ask first section prompt immediately (which is quarter_end_date)
                     current_key = report_section_keys[st.session_state.current_section_index]
-                    bot_response = report_section_prompts.get(current_key, "Please provide details for the next section.")
-                     # Ask for quarter end date first
-                    # bot_response = report_section_prompts["quarter_end_date"]
-                    # st.session_state.stage = "get_quarter_end_date"
+                    bot_response = report_section_prompts.get(current_key, "Please provide details for the first section.")
                 else:
                     bot_response = f"Please enter a valid quarter number (1-{PROJECT_DETAILS['Total Quarters']})."
             except ValueError:
                 bot_response = "Please enter a number for the quarter."
-
-        elif current_stage == "get_quarter_end_date":
-             # Add validation if needed
-             st.session_state.answers["quarter_end_date"] = prompt
-             st.session_state.current_section_index = 0
-             st.session_state.stage = "ask_section"
-             current_key = report_section_keys[st.session_state.current_section_index]
-             bot_response = report_section_prompts.get(current_key, "...") # Ask first real section
 
         elif current_stage == "ask_section":
             # Save answer for the *previous* section asked
@@ -273,63 +291,79 @@ if prompt := st.chat_input("Your answer or command..."):
                 # Ask next question
                 next_key = report_section_keys[st.session_state.current_section_index]
                 bot_response = report_section_prompts.get(next_key, "Please provide details for the next section.")
-                 # Optional: Ask for file upload if relevant to the next_key
-                 # if next_key in ["time", "risk_management"]:
-                 #     bot_response += "\n\n" + report_section_prompts["upload_request"]
+                 # Optional: Add request for file upload contextually
+                if next_key in ["time", "risk_management", "cost"]: # Add other relevant sections
+                     bot_response += "\n\n" + report_section_prompts["upload_request"]
             else:
                 # All sections done
                 st.session_state.stage = "confirm_generate"
                 bot_response = report_section_prompts["ready_to_generate"]
 
         elif current_stage == "confirm_generate":
-            if prompt.lower() in ["yes", "y", "ok", "generate"]:
-                if not st.session_state.credentials or not st.session_state.credentials.valid:
+            if prompt.lower() in ["yes", "y", "ok", "generate", "confirm"]:
+                # Check authentication status *before* attempting generation
+                creds = get_credentials() # Check/refresh credentials
+                if not creds or not creds.valid:
                      bot_response = "Please log in with Google first using the sidebar button before generating the document."
-                     # Try to initiate login if possible? Requires rerun logic.
-                     # get_credentials() # This might not work smoothly here. Best to instruct user.
+                     trigger_rerun = False # Don't rerun if waiting for auth
                 else:
+                    # Proceed with generation
                     st.session_state.stage = "generating"
-                    # Show spinner while generating
-                    with st.spinner("Generating Google Doc..."):
-                         doc_title = create_google_doc(
-                             st.session_state.credentials,
-                             st.session_state.current_quarter,
-                             st.session_state.answers
-                         )
-                    if doc_title:
-                         bot_response = report_section_prompts["generation_complete"].format(doc_title)
-                         st.session_state.stage = "done" # Or loop back to start?
-                    else:
-                         bot_response = report_section_prompts["error"] + " Failed to create document."
-                         st.session_state.stage = "confirm_generate" # Allow retry?
+                    bot_response = "Okay, generating the Google Doc now..." # Immediate feedback
+                    # Generation happens on the rerun triggered after this block
             else:
-                bot_response = "Okay, let me know when you're ready to generate the document."
-                # Stay in confirm_generate stage
+                bot_response = "Okay, I won't generate the document yet. Let me know if you change your mind."
+                # Stay in confirm_generate stage or reset? Resetting might be safer.
+                # st.session_state.stage = "start" # Option to reset conversation
 
-        # Handle other stages if needed (e.g., 'done', 'error')
+        # Separate stage for actual generation to show spinner correctly
+        elif current_stage == "generating":
+             # This stage is entered on the rerun after user confirms 'yes'
+             creds = get_credentials() # Get credentials again just in case
+             if creds and creds.valid:
+                 with st.spinner("Creating and populating Google Doc..."):
+                      doc_title = create_google_doc(
+                          creds,
+                          st.session_state.current_quarter,
+                          st.session_state.answers
+                      )
+                 if doc_title:
+                      bot_response = report_section_prompts["generation_complete"].format(doc_title)
+                      st.session_state.stage = "done" # Conversation loop ends or resets
+                 else:
+                      bot_response = report_section_prompts["error"] + " Failed during document creation."
+                      st.session_state.stage = "confirm_generate" # Go back to allow retry
+             else:
+                 bot_response = "Google authentication issue. Please try logging in again via the sidebar."
+                 st.session_state.stage = "confirm_generate" # Go back
+             trigger_rerun = True # Ensure UI updates after generation attempt
+
+
+        elif current_stage == "done":
+            # After generation, what next? Reset or wait?
+            bot_response = "Report generation complete. You can start a new report by telling me the quarter number, or close the session."
+            st.session_state.stage = "start" # Reset for next report
 
         else: # Default / Error stage
-             bot_response = report_section_prompts.get("error", "Sorry, I'm not sure how to proceed.")
+             bot_response = report_section_prompts.get("error", "Sorry, I'm not sure how to proceed from this state.")
              st.session_state.stage = "start" # Reset
 
     except Exception as e:
-         st.error(f"An error occurred in the bot logic: {e}")
+         st.error(f"An error occurred in the chatbot logic: {e}")
          bot_response = report_section_prompts.get("error", "An unexpected error occurred.")
-         # Optionally reset stage
-         # st.session_state.stage = "start"
+         st.session_state.stage = "start" # Reset on error
 
 
-    # Add bot response to history
+    # Add bot response to history and rerun if needed
     if bot_response:
         st.session_state.messages.append({"role": "assistant", "content": bot_response})
-        # Rerun immediately to show the bot response and update the UI state
+    if trigger_rerun:
         st.rerun()
-    # If no bot response generated (e.g., waiting for auth code), don't rerun yet
 
 
 # --- Initial Bot Prompt ---
-# Ensure the initial prompt is added only once or when the stage resets to 'start'
+# Add the initial prompt only if the chat history is empty.
 if not st.session_state.messages:
      initial_prompt = report_section_prompts["start"]
      st.session_state.messages.append({"role": "assistant", "content": initial_prompt})
-     st.rerun() # Rerun to display initial message
+     st.rerun() # Rerun to display the initial message
