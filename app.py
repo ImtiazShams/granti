@@ -132,49 +132,161 @@ def get_credentials():
         else: print("DEBUG: Waiting for auth code."); st.info("Waiting for authorization code."); return None
     else: st.error("'oob' flow required for this setup."); return None
 
-# --- Google Docs API Function (Unchanged) ---
+# --- Google Docs API Function (With Added Logging & Checks) ---
 def create_google_doc(credentials, quarter_number, answers):
+    """Creates a new Google Doc with the report content."""
     print("--- Entering create_google_doc function ---")
-    if not credentials or not credentials.valid: print("ERROR: Invalid creds for doc creation."); st.error("Invalid Google credentials."); return None
+
+    # --- Pre-API Call Checks ---
+    if not credentials:
+        err_msg = "Credentials object is None when trying to create doc."
+        print(f"ERROR: {err_msg}")
+        st.error(err_msg)
+        return None
+
+    print(f"DEBUG: Type of credentials object passed: {type(credentials)}")
+
+    # Check validity and scopes
+    if hasattr(credentials, 'valid'):
+        print(f"DEBUG: Credentials valid attribute: {credentials.valid}")
+        if not credentials.valid:
+             # Check for refresh token which might allow refresh
+             if hasattr(credentials, 'has_scopes') and credentials.has_scopes(SCOPES) and hasattr(credentials, 'refresh_token') and credentials.refresh_token:
+                  print("WARN: Credentials seem expired but refresh token exists. Attempting refresh implicitly by library...")
+                  # The library often handles refresh automatically if refresh token is present & scopes match
+                  # We can try forcing a refresh for debugging, requires RequestsCallback transport
+                  # try:
+                  #      from google.auth.transport.requests import Request
+                  #      credentials.refresh(Request())
+                  #      print("DEBUG: Manual refresh attempted.")
+                  #      if not credentials.valid: raise Exception("Refresh failed.")
+                  # except Exception as refresh_err:
+                  #      err_msg = f"Credentials expired and refresh failed: {refresh_err}"
+                  #      print(f"ERROR: {err_msg}")
+                  #      st.error(err_msg + " Please re-authenticate.")
+                  #      if 'credentials' in st.session_state: del st.session_state['credentials']
+                  #      st.rerun()
+                  #      return None
+
+             else:
+                  err_msg = "Credentials are not valid and/or refresh token is missing/scopes insufficient for refresh."
+                  print(f"ERROR: {err_msg}")
+                  st.error(err_msg + " Please re-authenticate.")
+                  if 'credentials' in st.session_state: del st.session_state['credentials']
+                  st.rerun() # Force rerun to prompt login
+                  return None
+    else:
+        print("WARN: Credentials object does not have 'valid' attribute. Proceeding cautiously.")
+
+    granted_scopes = []
+    if hasattr(credentials, 'scopes'):
+        granted_scopes = credentials.scopes or []
+        print(f"DEBUG: Scopes associated with credentials: {granted_scopes}")
+        # Verify required scopes are present
+        required_scopes_set = set(SCOPES)
+        granted_scopes_set = set(granted_scopes)
+        if not required_scopes_set.issubset(granted_scopes_set):
+             missing_scopes = required_scopes_set - granted_scopes_set
+             err_msg = f"Required scopes missing: {missing_scopes}. Please re-authenticate and ensure ALL permissions ({', '.join(SCOPES)}) are granted."
+             print(f"ERROR: {err_msg}")
+             st.error(err_msg)
+             if 'credentials' in st.session_state: del st.session_state['credentials']
+             st.rerun() # Force rerun to prompt login
+             return None
+        else:
+            print("DEBUG: All required scopes appear granted.")
+    else:
+        print("WARN: Could not read scopes from credentials object. Cannot verify permissions.")
+    # --- End Pre-API Call Checks ---
+
     try:
-        print("DEBUG: Building Google services...")
-        service = build('docs', 'v1', credentials=credentials)
-        drive_service = build('drive', 'v3', credentials=credentials)
+        print("DEBUG: Building Google Docs and Drive services...")
+        # Add cache_discovery=False for debugging if suspecting stale discovery docs
+        service_docs = build('docs', 'v1', credentials=credentials, cache_discovery=False)
+        service_drive = build('drive', 'v3', credentials=credentials, cache_discovery=False) # Use separate variable
+        print("DEBUG: Services built successfully.")
+
         title = f"Innovate UK Q{quarter_number} Report - {PROJECT_DETAILS['Project Number']} - Draft {datetime.now().strftime('%Y%m%d_%H%M')}"
-        print(f"DEBUG: Creating doc: {title}")
-        doc = service.documents().create(body={'title': title}).execute()
-        doc_id = doc.get('documentId')
-        if not doc_id: print("ERROR: No doc ID returned."); st.error("Failed to create Google Doc."); return None
-        print(f"DEBUG: Doc created ID: {doc_id}. Building content...")
-        full_text = f"# Innovate UK Quarterly Report - Q{quarter_number}\n\n**Project:** {PROJECT_DETAILS['Project title']} ({PROJECT_DETAILS['Project Number']})\n**Quarter End Date:** {answers.get('quarter_end_date', 'N/A')}\n\n---\n\n"
+        print(f"DEBUG: Attempting to create doc with title: {title}")
+
+        # --- Create Document using Drive API first (often more reliable for creation) ---
+        file_metadata = {
+            'name': title,
+            'mimeType': 'application/vnd.google-apps.document'
+        }
+        print(f"DEBUG: Calling drive.files().create() with metadata: {file_metadata}")
+        # Use fields='id' to only request the ID back
+        created_file = service_drive.files().create(body=file_metadata, fields='id').execute()
+        doc_id = created_file.get('id')
+
+        # doc_body_for_docs_create = {'title': title}
+        # print(f"DEBUG: Calling docs.documents().create() with body: {doc_body_for_docs_create}")
+        # doc = service_docs.documents().create(body=doc_body_for_docs_create).execute()
+        # doc_id = doc.get('documentId')
+
+        if not doc_id:
+            err_msg = "Failed to create Google Doc: No document ID returned from Drive API."
+            print(f"ERROR: {err_msg}")
+            st.error(err_msg)
+            return None
+        print(f"DEBUG: Google Doc created via Drive API with ID: {doc_id}")
+
+        # --- Now populate the created document using Docs API ---
+        print("DEBUG: Building report text content...")
+        full_text = f"# Innovate UK Quarterly Report - Q{quarter_number}\n\n"
+        full_text += f"**Project:** {PROJECT_DETAILS['Project title']} ({PROJECT_DETAILS['Project Number']})\n"
+        full_text += f"**Quarter End Date:** {answers.get('quarter_end_date', 'N/A')}\n\n---\n\n"
         for key in report_section_keys:
             if key == "quarter_end_date": continue
             section_title = key.replace('_', ' ').title()
             content = answers.get(key, "*No data entered for this section.*")
-            # Add previous answer context if available
             if st.session_state.current_quarter > 1:
                  prev_q_num = st.session_state.current_quarter - 1
                  prev_answer = st.session_state.get('all_answers', {}).get(prev_q_num, {}).get(key)
                  if prev_answer:
-                      content += f"\n\n*(Context: Your answer for Q{prev_q_num} was: '{prev_answer[:100]}...')*" # Show snippet
+                      # Truncate previous answer reasonably
+                      prev_answer_snippet = prev_answer[:200] + ('...' if len(prev_answer) > 200 else '')
+                      content += f"\n\n*(Context: Your answer for Q{prev_q_num} was: '{prev_answer_snippet}')*"
             full_text += f"## {section_title}\n\n{content}\n\n---\n\n"
-        print(f"DEBUG: Content built (len: {len(full_text)}). Executing batchUpdate...")
+        print(f"DEBUG: Report text built (length: {len(full_text)} chars).")
+
+        print("DEBUG: Preparing batchUpdate request...")
+        # Insert text at the beginning of the document body (index 1)
         requests = [{'insertText': {'location': {'index': 1}, 'text': full_text}}]
-        result = service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
-        print("DEBUG: batchUpdate success.")
+        print(f"DEBUG: Request body for batchUpdate: {requests}") # Log the request body
+
+        print(f"DEBUG: Executing batchUpdate for doc ID: {doc_id}...")
+        result = service_docs.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+        print(f"DEBUG: batchUpdate executed successfully. Result: {result}") # Log the result
         st.success(f"Successfully created and populated Google Doc.")
+
         doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
         st.markdown(f"**[Open Generated Document]({doc_url})**", unsafe_allow_html=True)
+
         return title
+
     except HttpError as error:
-        err_msg = f"Google API Error: {error}"
+        err_msg = f"Google API Error during document operation: {error}"
         print(f"ERROR: {err_msg}")
-        error_details = getattr(error, 'resp', {}).get('content', '{}')
-        print(f"ERROR DETAILS: {error_details}")
-        st.error(err_msg); st.write(f"Details: {error_details}"); return None
+        error_details_bytes = getattr(error, 'resp', {}).get('content', b'{}')
+        error_details_str = error_details_bytes.decode('utf-8', errors='ignore') # Decode bytes
+        print(f"ERROR DETAILS FROM GOOGLE (Decoded): {error_details_str}")
+        st.error(err_msg)
+        try:
+             # Try parsing Google's detailed error message
+             error_json = json.loads(error_details_str)
+             st.json(error_json) # Display detailed error from Google if available
+             google_error_message = error_json.get('error', {}).get('message', 'No specific message found in JSON.')
+             st.error(f"Google Error Message: {google_error_message}")
+        except Exception as parse_error:
+             print(f"Could not parse Google error details as JSON: {parse_error}")
+             st.write(f"Raw error content: {error_details_str}") # Show decoded string
+        return None
     except Exception as e:
-         err_msg = f"Unexpected error during doc creation: {e}"
-         print(f"ERROR: {err_msg}\n{traceback.format_exc()}"); st.error(err_msg); return None
+         err_msg = f"Unexpected error during document creation: {e}"
+         print(f"ERROR: {err_msg}\n{traceback.format_exc()}")
+         st.error(err_msg)
+         return None
 
 # --- Initialize Streamlit Session State ---
 if 'messages' not in st.session_state: st.session_state.messages = []
